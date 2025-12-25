@@ -3,6 +3,7 @@ type OpenAIOptions = {
   model: string;
   baseUrl: string;
   input: string;
+  language?: string;
 };
 
 type OpenAIMessage = {
@@ -88,8 +89,12 @@ export const requestText = async (options: OpenAIOptions): Promise<string> => {
 };
 
 export const generateCommitMessage = async (options: OpenAIOptions): Promise<OpenAIMessage> => {
+  const languageInstruction = options.language 
+    ? `Write the commit message in ${options.language}.`
+    : "Write a Conventional Commit message.";
+  
   const input = [
-    "Write a Conventional Commit message.",
+    languageInstruction,
     "Return JSON only: {\"subject\":\"type(scope): summary\",\"body\":\"optional body\"}.",
     "Keep subject <= 72 chars, imperative, no trailing period. Omit scope if unknown.",
     "",

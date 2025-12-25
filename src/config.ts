@@ -6,6 +6,7 @@ type Config = {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  language?: string;
 };
 
 export const getConfigPath = (): string => {

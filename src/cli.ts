@@ -89,20 +89,21 @@ const buildCommitInput = async (cwd: string, files: string[], staged: boolean, m
 
 const generateMessage = async (
   input: string,
-  config: { apiKey?: string; model?: string; baseUrl?: string },
+  config: { apiKey?: string; model?: string; baseUrl?: string; language?: string },
   modelOverride?: string
 ): Promise<{ subject: string; body?: string }> => {
   const apiKey = resolveApiKey(config.apiKey);
   const model = modelOverride ?? process.env.OPENAI_MODEL ?? config.model ?? DEFAULT_MODEL;
   const baseUrl = process.env.OPENAI_BASE_URL ?? config.baseUrl ?? "https://api.openai.com";
+  const language = process.env.OPENAI_LANGUAGE ?? config.language;
 
-  return generateCommitMessage({ apiKey, model, baseUrl, input });
+  return generateCommitMessage({ apiKey, model, baseUrl, input, language });
 };
 
 const proposeGroups = async (
   files: FileEntry[],
   diffStat: string,
-  config: { apiKey?: string; model?: string; baseUrl?: string },
+  config: { apiKey?: string; model?: string; baseUrl?: string; language?: string },
   modelOverride?: string
 ): Promise<Group[]> => {
   const apiKey = resolveApiKey(config.apiKey);
@@ -191,7 +192,7 @@ type CommitOptions = {
   auto: boolean;
   modelOverride?: string;
   maxDiffChars: number;
-  config: { apiKey?: string; model?: string; baseUrl?: string };
+  config: { apiKey?: string; model?: string; baseUrl?: string; language?: string };
 };
 
 const commitFlow = async (cwd: string, files: string[], options: CommitOptions): Promise<boolean> => {
@@ -287,7 +288,7 @@ const main = async (): Promise<void> => {
 
   if (args[0] === "init") {
     const existing = await loadConfig();
-    if (existing.apiKey || existing.model || existing.baseUrl) {
+    if (existing.apiKey || existing.model || existing.baseUrl || existing.language) {
       const overwrite = await promptYesNo("Config already exists. Overwrite?", false);
       if (!overwrite) {
         return;
@@ -296,10 +297,12 @@ const main = async (): Promise<void> => {
     const apiKey = await promptText("OpenAI API key: ");
     const model = await promptText(`Model (${DEFAULT_MODEL}): `);
     const baseUrl = await promptText("Base URL (https://api.openai.com): ");
+    const language = await promptText("Language for commit messages (e.g., Portuguese, English, Spanish): ");
     const path = await writeConfig({
       apiKey: apiKey || undefined,
       model: model || undefined,
-      baseUrl: baseUrl || undefined
+      baseUrl: baseUrl || undefined,
+      language: language || undefined
     });
     console.log(`Config written to ${path}`);
     return;
