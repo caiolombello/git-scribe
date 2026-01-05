@@ -70,22 +70,37 @@ export const requestText = async (options: OpenAIOptions): Promise<string> => {
     max_output_tokens: 400
   };
 
-  const response = await fetch(`${options.baseUrl}/v1/responses`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${options.apiKey}`
-    },
-    body: JSON.stringify(body)
-  });
+  const maxRetries = 3;
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const response = await fetch(`${options.baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${options.apiKey}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (response.ok) {
+      const payload = (await response.json()) as unknown;
+      return extractText(payload);
+    }
+
+    const status = response.status;
     const errText = await response.text();
-    throw new Error(`OpenAI error: ${response.status} ${errText}`);
+    lastError = new Error(`OpenAI error: ${status} ${errText}`);
+
+    if (status !== 429 && status < 500) {
+      throw lastError;
+    }
+
+    const delay = Math.pow(2, attempt) * 1000;
+    await new Promise((r) => setTimeout(r, delay));
   }
 
-  const payload = (await response.json()) as unknown;
-  return extractText(payload);
+  throw lastError ?? new Error("Request failed after retries");
 };
 
 export const generateCommitMessage = async (options: OpenAIOptions): Promise<OpenAIMessage> => {

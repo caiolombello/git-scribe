@@ -145,3 +145,22 @@ export const hasStagedChanges = async (cwd: string, files: string[]): Promise<bo
   const out = await assertGit(["diff", "--cached", "--name-only", "--", ...files], cwd);
   return out.trim().length > 0;
 };
+
+export const getRecentCommits = async (cwd: string, count = 5): Promise<string> => {
+  const out = await assertGit(["log", `--oneline`, `-${count}`, "--no-decorate"], cwd).catch(() => "");
+  return out.trim();
+};
+
+export const getLastCommitMessage = async (cwd: string): Promise<{ subject: string; body?: string }> => {
+  const subject = (await assertGit(["log", "-1", "--format=%s"], cwd)).trim();
+  const body = (await assertGit(["log", "-1", "--format=%b"], cwd)).trim();
+  return { subject, body: body || undefined };
+};
+
+export const amendCommit = async (cwd: string, subject: string, body?: string): Promise<void> => {
+  const args = ["commit", "--amend", "-m", subject];
+  if (body && body.trim().length > 0) {
+    args.push("-m", body.trim());
+  }
+  await assertGit(args, cwd);
+};

@@ -8,11 +8,16 @@ import {
   restoreStagedFiles,
   commitFiles,
   getShortStatus,
-  hasStagedChanges
+  hasStagedChanges,
+  getRecentCommits,
+  getLastCommitMessage,
+  amendCommit
 } from "./git";
 import { getConfigPath, loadConfig, writeConfig } from "./config";
 import { generateCommitMessage, requestText } from "./openai";
 import { multiSelect, promptMessageEdit, promptYesNo, singleSelect, promptText, SelectItemType } from "./ui";
+import { getCachedMessage, setCachedMessage } from "./cache";
+import { detectMonorepoScope, validateConventionalCommit } from "./validation";
 
 type Group = {
   name: string;
@@ -26,6 +31,35 @@ type FileEntry = {
 
 const DEFAULT_MAX_DIFF_CHARS = 20000;
 const DEFAULT_MODEL = "gpt-5.1-codex-mini";
+const MAX_FILES_FOR_GROUPING = 30;
+const BINARY_EXTENSIONS = new Set([
+  // Imagens
+  ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg", ".tiff", ".psd", ".ai",
+  // Fontes
+  ".woff", ".woff2", ".ttf", ".eot", ".otf",
+  // Documentos
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt",
+  // Arquivos compactados
+  ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".tgz", ".xz",
+  // Áudio/Vídeo
+  ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac", ".ogg", ".webm", ".m4a",
+  // Executáveis/Binários
+  ".exe", ".dll", ".so", ".dylib", ".bin", ".dat", ".o", ".a",
+  // Databases
+  ".db", ".sqlite", ".sqlite3",
+  // Outros
+  ".lock", ".lockb", ".yarn-integrity", ".pnp.cjs"
+]);
+
+const IGNORED_PATHS = ["node_modules/", ".git/", "dist/", "build/", ".next/", ".nuxt/", ".output/", "vendor/", "__pycache__/", ".venv/", "venv/", ".cache/", ".turbo/"];
+
+const shouldIgnoreFile = (path: string): boolean => {
+  if (IGNORED_PATHS.some((p) => path.includes(p))) return true;
+  const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
+  return BINARY_EXTENSIONS.has(ext);
+};
+
+const estimateTokens = (text: string): number => Math.ceil(text.length / 4);
 
 const truncate = (value: string, maxChars: number): string => {
   if (maxChars <= 0) {
@@ -72,32 +106,54 @@ const extractGroupJson = (text: string): Group[] | null => {
   }
 };
 
-const buildCommitInput = async (cwd: string, files: string[], staged: boolean, maxDiffChars: number): Promise<string> => {
+const buildCommitInput = async (cwd: string, files: string[], staged: boolean, maxDiffChars: number, recentCommits?: string): Promise<string> => {
+  const textFiles = files.filter((f) => !shouldIgnoreFile(f));
+  const ignoredFiles = files.filter((f) => shouldIgnoreFile(f));
+  
   const status = await getShortStatus(cwd, files);
-  const stat = await getDiffStat(cwd, staged, files);
-  const patch = await getDiff(cwd, staged, files);
+  const stat = await getDiffStat(cwd, staged, textFiles);
+  const patch = await getDiff(cwd, staged, textFiles);
 
-  return [
+  const parts = [
     "Selected files:",
-    status || files.join("\n"),
-    "\nDiffstat:",
-    stat || "(empty)",
-    "\nPatch:",
-    truncate(patch, maxDiffChars)
-  ].join("\n");
+    status || files.join("\n")
+  ];
+
+  if (ignoredFiles.length > 0) {
+    parts.push(`\nIgnored from diff (${ignoredFiles.length}): ${ignoredFiles.slice(0, 5).join(", ")}${ignoredFiles.length > 5 ? "..." : ""}`);
+  }
+
+  parts.push("\nDiffstat:", stat || "(empty)");
+
+  // Se patch muito grande, omitir e usar só diffstat
+  if (patch.length > maxDiffChars * 2) {
+    parts.push("\n[patch omitted - too large, using diffstat only]");
+  } else {
+    parts.push("\nPatch:", truncate(patch, maxDiffChars));
+  }
+
+  if (recentCommits) {
+    parts.unshift("Recent commits (for style reference):", recentCommits, "");
+  }
+
+  return parts.join("\n");
 };
 
 const generateMessage = async (
   input: string,
   config: { apiKey?: string; model?: string; baseUrl?: string; language?: string },
-  modelOverride?: string
+  modelOverride?: string,
+  scopeOverride?: string
 ): Promise<{ subject: string; body?: string }> => {
   const apiKey = resolveApiKey(config.apiKey);
   const model = modelOverride ?? process.env.OPENAI_MODEL ?? config.model ?? DEFAULT_MODEL;
   const baseUrl = process.env.OPENAI_BASE_URL ?? config.baseUrl ?? "https://api.openai.com";
   const language = process.env.OPENAI_LANGUAGE ?? config.language;
 
-  return generateCommitMessage({ apiKey, model, baseUrl, input, language });
+  const scopeHint = scopeOverride ? `\nUse scope: ${scopeOverride}` : "";
+  const modifiedInput = scopeHint ? input + scopeHint : input;
+
+  return generateCommitMessage({ apiKey, model, baseUrl, input: modifiedInput, language });
 };
 
 const proposeGroups = async (
@@ -110,15 +166,57 @@ const proposeGroups = async (
   const model = modelOverride ?? process.env.OPENAI_MODEL ?? config.model ?? DEFAULT_MODEL;
   const baseUrl = process.env.OPENAI_BASE_URL ?? config.baseUrl ?? "https://api.openai.com";
 
+  // Se muitos arquivos, processar em batches e agrupar por diretório primeiro
+  if (files.length > MAX_FILES_FOR_GROUPING) {
+    console.log(`Large changeset (${files.length} files). Using directory-based pre-grouping...`);
+    const dirGroups = groupByDirectory(files);
+    const allGroups: Group[] = [];
+
+    for (const dirGroup of dirGroups) {
+      if (dirGroup.files.length <= 5) {
+        allGroups.push(dirGroup);
+        continue;
+      }
+
+      // Subdividir grupos grandes com IA
+      const subFiles = files.filter((f) => dirGroup.files.includes(f.path));
+      const subInput = [
+        "Group these related files into logical Conventional Commits.",
+        "Return JSON only: [{\"name\":\"short name\",\"files\":[\"path\"]}].",
+        "\nFiles:",
+        ...subFiles.map((f) => `- ${f.path} (${f.status})`)
+      ].join("\n");
+
+      try {
+        const text = await requestText({ apiKey, model, baseUrl, input: subInput });
+        const parsed = extractGroupJson(text);
+        if (parsed && parsed.length > 0) {
+          allGroups.push(...parsed);
+        } else {
+          allGroups.push(dirGroup);
+        }
+      } catch {
+        allGroups.push(dirGroup);
+      }
+    }
+
+    return allGroups;
+  }
+
+  // Fluxo normal para poucos arquivos
   const input = [
     "You are grouping files into multiple Conventional Commits.",
     "Return JSON only: [{\"name\":\"short name\",\"files\":[\"path\"]}].",
     "Use only the provided file paths. Avoid overlap.",
     "\nFiles:",
     ...files.map((file) => `- ${file.path} (${file.status})`),
-    "\nDiffstat:",
-    diffStat || "(empty)"
+    diffStat ? `\nDiffstat:\n${diffStat}` : ""
   ].join("\n");
+
+  const tokens = estimateTokens(input);
+  if (tokens > 3000) {
+    console.log(`Warning: Large input (~${tokens} tokens). Response may be incomplete.`);
+  }
 
   const text = await requestText({ apiKey, model, baseUrl, input });
   const parsed = extractGroupJson(text);
@@ -193,6 +291,8 @@ type CommitOptions = {
   modelOverride?: string;
   maxDiffChars: number;
   config: { apiKey?: string; model?: string; baseUrl?: string; language?: string };
+  scopeOverride?: string;
+  repoRoot: string;
 };
 
 const commitFlow = async (cwd: string, files: string[], options: CommitOptions): Promise<boolean> => {
@@ -213,16 +313,36 @@ const commitFlow = async (cwd: string, files: string[], options: CommitOptions):
     }
   }
 
-  const input = await buildCommitInput(cwd, files, !options.dryRun, options.maxDiffChars);
+  const recentCommits = await getRecentCommits(cwd);
+  const input = await buildCommitInput(cwd, files, !options.dryRun, options.maxDiffChars, recentCommits);
+  
+  // Check cache
+  const cached = await getCachedMessage(options.repoRoot, input);
   let suggestion: { subject: string; body?: string };
 
-  try {
-    suggestion = await generateMessage(input, options.config, options.modelOverride);
-  } catch (err) {
-    if (!options.dryRun) {
-      await restoreStagedFiles(cwd, files);
+  if (cached && !options.scopeOverride) {
+    suggestion = cached;
+    console.log("Using cached message...");
+  } else {
+    // Detect monorepo scope if not overridden
+    const scope = options.scopeOverride ?? await detectMonorepoScope(cwd, files);
+    
+    try {
+      suggestion = await generateMessage(input, options.config, options.modelOverride, scope ?? undefined);
+      await setCachedMessage(options.repoRoot, input, suggestion);
+    } catch (err) {
+      if (!options.dryRun) {
+        await restoreStagedFiles(cwd, files);
+      }
+      throw err;
     }
-    throw err;
+  }
+
+  // Validate message
+  const validation = validateConventionalCommit(suggestion.subject);
+  if (!validation.valid) {
+    console.log("\nWarning: Message validation issues:");
+    validation.errors.forEach((e) => console.log(`  - ${e}`));
   }
 
   const edited = options.auto ? suggestion : await promptMessageEdit(suggestion.subject, suggestion.body);
@@ -234,6 +354,19 @@ const commitFlow = async (cwd: string, files: string[], options: CommitOptions):
       }
     }
     return false;
+  }
+
+  // Validate edited message
+  if (edited.subject !== suggestion.subject) {
+    const editedValidation = validateConventionalCommit(edited.subject);
+    if (!editedValidation.valid) {
+      console.log("\nWarning: Edited message has issues:");
+      editedValidation.errors.forEach((e) => console.log(`  - ${e}`));
+      const proceed = await promptYesNo("Continue anyway?", false);
+      if (!proceed) {
+        return false;
+      }
+    }
   }
 
   if (options.dryRun) {
@@ -280,7 +413,9 @@ const main = async (): Promise<void> => {
         "  --hunks",
         "  --auto",
         "  --model <name>",
-        "  --max-diff-chars <n>"
+        "  --max-diff-chars <n>",
+        "  --scope <name>",
+        "  --amend"
       ].join("\n")
     );
     return;
@@ -310,24 +445,74 @@ const main = async (): Promise<void> => {
 
   const cwd = process.cwd();
   const repoRoot = await getRepoRoot(cwd);
-  const status = await getStatus(repoRoot);
-  const entries = toFileEntries(status);
   const config = await loadConfig();
-
-  if (entries.length === 0) {
-    console.log("No changes detected.");
-    return;
-  }
 
   const modeArg = getFlag(args, "--mode");
   const useHunks = hasFlag(args, "--hunks");
   const dryRun = hasFlag(args, "--dry-run");
   const auto = hasFlag(args, "--auto");
   const modelOverride = getFlag(args, "--model");
+  const scopeOverride = getFlag(args, "--scope");
+  const isAmend = hasFlag(args, "--amend");
   const maxDiffRaw = getFlag(args, "--max-diff-chars");
   const maxDiffChars = maxDiffRaw ? Number(maxDiffRaw) : DEFAULT_MAX_DIFF_CHARS;
   if (Number.isNaN(maxDiffChars)) {
     throw new Error("Invalid value for --max-diff-chars");
+  }
+
+  // Handle --amend mode
+  if (isAmend) {
+    const lastMsg = await getLastCommitMessage(repoRoot);
+    const recentCommits = await getRecentCommits(repoRoot);
+    const diff = await getDiff(repoRoot, false);
+    const stat = await getDiffStat(repoRoot, false);
+    
+    const input = [
+      "Recent commits (for style reference):",
+      recentCommits,
+      "",
+      "Current commit message:",
+      lastMsg.subject,
+      lastMsg.body ? `\n${lastMsg.body}` : "",
+      "\nDiffstat:",
+      stat || "(empty)",
+      "\nPatch:",
+      truncate(diff, maxDiffChars)
+    ].join("\n");
+
+    const scope = scopeOverride ?? await detectMonorepoScope(repoRoot, []);
+    const suggestion = await generateMessage(input, config, modelOverride, scope ?? undefined);
+    
+    const validation = validateConventionalCommit(suggestion.subject);
+    if (!validation.valid) {
+      console.log("\nWarning: Message validation issues:");
+      validation.errors.forEach((e) => console.log(`  - ${e}`));
+    }
+
+    const edited = auto ? suggestion : await promptMessageEdit(suggestion.subject, suggestion.body);
+    if (!edited) return;
+
+    if (dryRun) {
+      console.log("\nAmended commit message preview:");
+      console.log(edited.subject);
+      if (edited.body?.trim()) console.log("\n" + edited.body.trim());
+      return;
+    }
+
+    const proceed = auto ? true : await promptYesNo("Amend commit now?", true);
+    if (proceed) {
+      await amendCommit(repoRoot, edited.subject, edited.body);
+      console.log("Commit amended.");
+    }
+    return;
+  }
+
+  const status = await getStatus(repoRoot);
+  const entries = toFileEntries(status);
+
+  if (entries.length === 0) {
+    console.log("No changes detected.");
+    return;
   }
 
   const validModes = new Set(["single", "manual", "ai"]);
@@ -351,7 +536,9 @@ const main = async (): Promise<void> => {
     auto,
     modelOverride: modelOverride || undefined,
     maxDiffChars,
-    config
+    config,
+    scopeOverride: scopeOverride || undefined,
+    repoRoot
   };
   if (mode === "single") {
     const selected = await pickFiles("Select files to include", entries);
