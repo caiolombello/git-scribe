@@ -1,9 +1,17 @@
+type RetryConfig = {
+  maxRetries?: number;
+  baseDelay?: number;
+  maxDelay?: number;
+  timeout?: number;
+};
+
 type OpenAIOptions = {
   apiKey: string;
   model: string;
   baseUrl: string;
   input: string;
   language?: string;
+  retry?: RetryConfig;
 };
 
 type OpenAIMessage = {
@@ -49,7 +57,19 @@ const extractJson = (text: string): OpenAIMessage | null => {
   }
 };
 
+const fetchWithTimeout = async (url: string, init: RequestInit, timeout: number): Promise<Response> => {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+};
+
 export const requestText = async (options: OpenAIOptions): Promise<string> => {
+  const { maxRetries = 3, baseDelay = 1000, maxDelay = 30000, timeout = 60000 } = options.retry ?? {};
+  
   const body = {
     model: options.model,
     input: [
@@ -70,33 +90,50 @@ export const requestText = async (options: OpenAIOptions): Promise<string> => {
     max_output_tokens: 400
   };
 
-  const maxRetries = 3;
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const response = await fetch(`${options.baseUrl}/v1/responses`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${options.apiKey}`
-      },
-      body: JSON.stringify(body)
-    });
+    try {
+      const response = await fetchWithTimeout(
+        `${options.baseUrl}/v1/responses`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${options.apiKey}`
+          },
+          body: JSON.stringify(body)
+        },
+        timeout
+      );
 
-    if (response.ok) {
-      const payload = (await response.json()) as unknown;
-      return extractText(payload);
+      if (response.ok) {
+        const payload = (await response.json()) as unknown;
+        return extractText(payload);
+      }
+
+      const status = response.status;
+      const errText = await response.text();
+      lastError = new Error(`OpenAI error: ${status} ${errText}`);
+
+      if (status !== 429 && status < 500) {
+        throw lastError;
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        lastError = new Error(`Request timeout after ${timeout}ms`);
+      } else if (err instanceof Error) {
+        lastError = err;
+      }
+      if (lastError && !lastError.message.includes("429") && !lastError.message.includes("5")) {
+        if (!(lastError.message.includes("timeout") || lastError.message.includes("ECONNRESET"))) {
+          throw lastError;
+        }
+      }
     }
 
-    const status = response.status;
-    const errText = await response.text();
-    lastError = new Error(`OpenAI error: ${status} ${errText}`);
-
-    if (status !== 429 && status < 500) {
-      throw lastError;
-    }
-
-    const delay = Math.pow(2, attempt) * 1000;
+    const jitter = Math.random() * 0.3 + 0.85; // 0.85-1.15
+    const delay = Math.min(baseDelay * Math.pow(2, attempt) * jitter, maxDelay);
     await new Promise((r) => setTimeout(r, delay));
   }
 
