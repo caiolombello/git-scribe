@@ -141,7 +141,7 @@ const buildCommitInput = async (cwd: string, files: string[], staged: boolean, m
 
 const generateMessage = async (
   input: string,
-  config: { apiKey?: string; model?: string; baseUrl?: string; language?: string },
+  config: { apiKey?: string; model?: string; baseUrl?: string; language?: string; retry?: { maxRetries?: number; baseDelay?: number; maxDelay?: number; timeout?: number } },
   modelOverride?: string,
   scopeOverride?: string
 ): Promise<{ subject: string; body?: string }> => {
@@ -153,7 +153,7 @@ const generateMessage = async (
   const scopeHint = scopeOverride ? `\nUse scope: ${scopeOverride}` : "";
   const modifiedInput = scopeHint ? input + scopeHint : input;
 
-  return generateCommitMessage({ apiKey, model, baseUrl, input: modifiedInput, language });
+  return generateCommitMessage({ apiKey, model, baseUrl, input: modifiedInput, language, retry: config.retry });
 };
 
 const proposeGroups = async (
@@ -412,6 +412,7 @@ const main = async (): Promise<void> => {
         "  --dry-run",
         "  --hunks",
         "  --auto",
+        "  --batch",
         "  --model <name>",
         "  --max-diff-chars <n>",
         "  --scope <name>",
@@ -454,6 +455,7 @@ const main = async (): Promise<void> => {
   const modelOverride = getFlag(args, "--model");
   const scopeOverride = getFlag(args, "--scope");
   const isAmend = hasFlag(args, "--amend");
+  const isBatch = hasFlag(args, "--batch");
   const maxDiffRaw = getFlag(args, "--max-diff-chars");
   const maxDiffChars = maxDiffRaw ? Number(maxDiffRaw) : DEFAULT_MAX_DIFF_CHARS;
   if (Number.isNaN(maxDiffChars)) {
@@ -582,9 +584,13 @@ const main = async (): Promise<void> => {
       groups = groupByDirectory(remaining);
     }
 
-    const group = await pickGroup("Pick a group to commit", groups);
+    const group = isBatch ? groups[0] : await pickGroup("Pick a group to commit", groups);
     if (!group) {
       return;
+    }
+
+    if (isBatch) {
+      console.log(`Committing: ${group.name} (${group.files.length} files)`);
     }
 
     const committed = await commitFlow(repoRoot, group.files, options);
@@ -593,7 +599,7 @@ const main = async (): Promise<void> => {
     }
 
     if (remaining.length > 0) {
-      const continueLoop = options.auto ? true : await promptYesNo("Create another commit?", true);
+      const continueLoop = (options.auto || isBatch) ? true : await promptYesNo("Create another commit?", true);
       if (!continueLoop) {
         return;
       }

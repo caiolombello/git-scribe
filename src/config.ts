@@ -7,6 +7,12 @@ type Config = {
   model?: string;
   baseUrl?: string;
   language?: string;
+  retry?: {
+    maxRetries?: number;
+    baseDelay?: number;
+    maxDelay?: number;
+    timeout?: number;
+  };
 };
 
 export const getConfigPath = (): string => {
