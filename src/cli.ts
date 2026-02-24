@@ -18,6 +18,7 @@ import { generateCommitMessage, requestText } from "./openai";
 import { multiSelect, promptMessageEdit, promptYesNo, singleSelect, promptText, SelectItemType } from "./ui";
 import { getCachedMessage, setCachedMessage } from "./cache";
 import { detectMonorepoScope, validateConventionalCommit } from "./validation";
+import packageJson from "../package.json" assert { type: "json" };
 
 type Group = {
   name: string;
@@ -32,6 +33,7 @@ type FileEntry = {
 const DEFAULT_MAX_DIFF_CHARS = 20000;
 const DEFAULT_MODEL = "gpt-5.1-codex-mini";
 const MAX_FILES_FOR_GROUPING = 30;
+const VERSION = typeof packageJson.version === "string" ? packageJson.version : "unknown";
 const BINARY_EXTENSIONS = new Set([
   // Imagens
   ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg", ".tiff", ".psd", ".ai",
@@ -403,11 +405,16 @@ const hasFlag = (args: string[], flag: string): boolean => args.includes(flag);
 
 const main = async (): Promise<void> => {
   const args = process.argv.slice(2);
+  if (hasFlag(args, "--version") || hasFlag(args, "-v") || args[0] === "version") {
+    console.log(`git-scribe ${VERSION}`);
+    return;
+  }
   if (hasFlag(args, "--help") || hasFlag(args, "-h")) {
     console.log(
       [
         "git-scribe usage:",
         "  init",
+        "  version",
         "  --mode <single|manual|ai>",
         "  --dry-run",
         "  --hunks",
@@ -416,7 +423,8 @@ const main = async (): Promise<void> => {
         "  --model <name>",
         "  --max-diff-chars <n>",
         "  --scope <name>",
-        "  --amend"
+        "  --amend",
+        "  --version, -v"
       ].join("\n")
     );
     return;
