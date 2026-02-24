@@ -7,6 +7,9 @@
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build src/cli.ts --target=bun --outdir dist"
+    "build": "bun build src/cli.ts --target=node --outdir dist",
+    "build:bun": "bun build src/cli.ts --target=bun --outdir dist",
+    "build:node": "bun build src/cli.ts --target=node --outdir dist",
+    "test": "bun test"
   }
 }
