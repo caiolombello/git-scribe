@@ -1,4 +1,5 @@
-import { spawn } from "bun";
+import { spawn } from "node:child_process";
+import { debugLog } from "./logging";
 
 export type FileStatus = {
   path: string;
@@ -13,29 +14,49 @@ type RunResult = {
   exitCode: number;
 };
 
+const collectStream = async (stream: NodeJS.ReadableStream | null): Promise<string> => {
+  if (!stream) {
+    return "";
+  }
+  return new Promise((resolve) => {
+    let data = "";
+    stream.on("data", (chunk) => {
+      data += chunk.toString();
+    });
+    stream.on("end", () => resolve(data));
+    stream.on("close", () => resolve(data));
+  });
+};
+
 const runGit = async (args: string[], cwd?: string): Promise<RunResult> => {
-  const proc = spawn(["git", ...args], {
+  debugLog(`[git] git ${args.join(" ")}`);
+  const proc = spawn("git", args, {
     cwd,
-    stdout: "pipe",
-    stderr: "pipe"
+    stdio: ["ignore", "pipe", "pipe"]
   });
 
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const exitCode = await proc.exited;
+  const [stdout, stderr] = await Promise.all([
+    collectStream(proc.stdout),
+    collectStream(proc.stderr)
+  ]);
+
+  const exitCode = await new Promise<number>((resolve) => {
+    proc.on("close", (code) => resolve(code ?? 0));
+  });
 
   return { stdout, stderr, exitCode };
 };
 
 const runGitInteractive = async (args: string[], cwd?: string): Promise<number> => {
-  const proc = spawn(["git", ...args], {
+  debugLog(`[git] git ${args.join(" ")} (interactive)`);
+  const proc = spawn("git", args, {
     cwd,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: "inherit"
+    stdio: "inherit"
   });
 
-  return proc.exited;
+  return new Promise<number>((resolve) => {
+    proc.on("close", (code) => resolve(code ?? 0));
+  });
 };
 
 const assertGit = async (args: string[], cwd?: string): Promise<string> => {
@@ -48,6 +69,11 @@ const assertGit = async (args: string[], cwd?: string): Promise<string> => {
 
 export const getRepoRoot = async (cwd: string): Promise<string> => {
   const out = await assertGit(["rev-parse", "--show-toplevel"], cwd);
+  return out.trim();
+};
+
+export const getGitDir = async (cwd: string): Promise<string> => {
+  const out = await assertGit(["rev-parse", "--git-dir"], cwd);
   return out.trim();
 };
 
