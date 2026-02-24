@@ -7,14 +7,37 @@ type SelectItem = {
   details?: string[];
 };
 
+type SelectOptions = {
+  pageSize?: number;
+};
+
+const isInteractive = (): boolean => {
+  return Boolean(input.isTTY && output.isTTY && process.env.GIT_SCRIBE_NON_INTERACTIVE !== "1");
+};
+
 const clearScreen = (): void => {
   output.write("\x1b[2J\x1b[H");
 };
 
-const renderList = (title: string, items: SelectItem[], selectedIndex: number, selected: Set<number>, footer?: string): void => {
+const renderList = (
+  title: string,
+  items: SelectItem[],
+  selectedIndex: number,
+  selected: Set<number>,
+  offset: number,
+  pageSize: number,
+  footer?: string
+): void => {
   clearScreen();
   output.write(`${title}\n\n`);
-  for (let i = 0; i < items.length; i += 1) {
+  const end = Math.min(items.length, offset + pageSize);
+  const maxRows = output.rows ?? 24;
+  const headerRows = 3;
+  const footerRows = 2;
+  const pageInfoRows = 1;
+  const detailBudget = Math.max(0, maxRows - (headerRows + footerRows + pageInfoRows + (end - offset)));
+
+  for (let i = offset; i < end; i += 1) {
     const item = items[i];
     const isCurrent = i === selectedIndex;
     const isSelected = selected.has(i);
@@ -22,45 +45,85 @@ const renderList = (title: string, items: SelectItem[], selectedIndex: number, s
     const pointer = isCurrent ? ">" : " ";
     output.write(`${pointer} ${prefix} ${item.label}\n`);
     if (isCurrent && item.details && item.details.length > 0) {
-      for (const detail of item.details) {
+      const details = detailBudget > 0 ? item.details.slice(0, detailBudget) : [];
+      for (const detail of details) {
         output.write(`    ${detail}\n`);
       }
     }
   }
-  output.write("\n");
-  output.write(footer ?? "Arrows to move, space to toggle, enter to confirm, q to quit.\n");
+  output.write(`\n[${offset + 1}-${end} of ${items.length}]\n`);
+  output.write(footer ?? "Arrows to move, PgUp/PgDn to jump, space to toggle, enter to confirm, q to quit.\n");
 };
 
-const renderMenu = (title: string, items: SelectItem[], selectedIndex: number, footer?: string): void => {
+const renderMenu = (
+  title: string,
+  items: SelectItem[],
+  selectedIndex: number,
+  offset: number,
+  pageSize: number,
+  footer?: string
+): void => {
   clearScreen();
   output.write(`${title}\n\n`);
-  for (let i = 0; i < items.length; i += 1) {
+  const end = Math.min(items.length, offset + pageSize);
+  const maxRows = output.rows ?? 24;
+  const headerRows = 3;
+  const footerRows = 2;
+  const pageInfoRows = 1;
+  const detailBudget = Math.max(0, maxRows - (headerRows + footerRows + pageInfoRows + (end - offset)));
+
+  for (let i = offset; i < end; i += 1) {
     const item = items[i];
     const isCurrent = i === selectedIndex;
     const pointer = isCurrent ? ">" : " ";
     output.write(`${pointer} ${item.label}\n`);
     if (isCurrent && item.details && item.details.length > 0) {
-      for (const detail of item.details) {
+      const details = detailBudget > 0 ? item.details.slice(0, detailBudget) : [];
+      for (const detail of details) {
         output.write(`    ${detail}\n`);
       }
     }
   }
-  output.write("\n");
-  output.write(footer ?? "Arrows to move, enter to confirm, q to quit.\n");
+  output.write(`\n[${offset + 1}-${end} of ${items.length}]\n`);
+  output.write(footer ?? "Arrows to move, PgUp/PgDn to jump, enter to confirm, q to quit.\n");
 };
 
-export const multiSelect = async (title: string, items: SelectItem[], defaults?: Set<number>): Promise<number[] | null> => {
-  if (!input.isTTY || !output.isTTY) {
+const resolvePageSize = (options?: SelectOptions): number => {
+  if (options?.pageSize && options.pageSize > 0) {
+    return Math.max(5, Math.floor(options.pageSize));
+  }
+  const rows = output.rows ?? 24;
+  return Math.max(5, rows - 6);
+};
+
+const resolveOffset = (index: number, offset: number, pageSize: number, length: number): number => {
+  if (length <= pageSize) {
+    return 0;
+  }
+  if (index < offset) {
+    return index;
+  }
+  if (index >= offset + pageSize) {
+    return Math.min(length - pageSize, index - pageSize + 1);
+  }
+  return offset;
+};
+
+export const multiSelect = async (title: string, items: SelectItem[], defaults?: Set<number>, options?: SelectOptions): Promise<number[] | null> => {
+  if (!isInteractive()) {
     return items.map((_, index) => index);
   }
 
   const selected = defaults ? new Set(defaults) : new Set<number>();
   let index = 0;
+  let offset = 0;
+  const pageSize = resolvePageSize(options);
 
   input.setRawMode(true);
   input.resume();
 
-  renderList(title, items, index, selected);
+  offset = resolveOffset(index, offset, pageSize, items.length);
+  renderList(title, items, index, selected, offset, pageSize);
 
   return new Promise((resolve) => {
     const onKey = (key: string): void => {
@@ -87,6 +150,12 @@ export const multiSelect = async (title: string, items: SelectItem[], defaults?:
       if (key === "\u001b[B") {
         index = index >= items.length - 1 ? 0 : index + 1;
       }
+      if (key === "\u001b[5~") {
+        index = Math.max(0, index - pageSize);
+      }
+      if (key === "\u001b[6~") {
+        index = Math.min(items.length - 1, index + pageSize);
+      }
       if (key.toLowerCase() === "a") {
         if (selected.size === items.length) {
           selected.clear();
@@ -95,7 +164,8 @@ export const multiSelect = async (title: string, items: SelectItem[], defaults?:
           items.forEach((_, idx) => selected.add(idx));
         }
       }
-      renderList(title, items, index, selected);
+      offset = resolveOffset(index, offset, pageSize, items.length);
+      renderList(title, items, index, selected, offset, pageSize);
     };
 
     const cleanup = (): void => {
@@ -110,17 +180,20 @@ export const multiSelect = async (title: string, items: SelectItem[], defaults?:
   });
 };
 
-export const singleSelect = async (title: string, items: SelectItem[]): Promise<number | null> => {
-  if (!input.isTTY || !output.isTTY) {
+export const singleSelect = async (title: string, items: SelectItem[], options?: SelectOptions): Promise<number | null> => {
+  if (!isInteractive()) {
     return 0;
   }
 
   let index = 0;
+  let offset = 0;
+  const pageSize = resolvePageSize(options);
 
   input.setRawMode(true);
   input.resume();
 
-  renderMenu(title, items, index);
+  offset = resolveOffset(index, offset, pageSize, items.length);
+  renderMenu(title, items, index, offset, pageSize);
 
   return new Promise((resolve) => {
     const onKey = (key: string): void => {
@@ -140,7 +213,14 @@ export const singleSelect = async (title: string, items: SelectItem[]): Promise<
       if (key === "\u001b[B") {
         index = index >= items.length - 1 ? 0 : index + 1;
       }
-      renderMenu(title, items, index);
+      if (key === "\u001b[5~") {
+        index = Math.max(0, index - pageSize);
+      }
+      if (key === "\u001b[6~") {
+        index = Math.min(items.length - 1, index + pageSize);
+      }
+      offset = resolveOffset(index, offset, pageSize, items.length);
+      renderMenu(title, items, index, offset, pageSize);
     };
 
     const cleanup = (): void => {
